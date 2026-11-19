@@ -1,0 +1,4 @@
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+z3-solver==5.4.1.0
+python-multipart==0.0.33

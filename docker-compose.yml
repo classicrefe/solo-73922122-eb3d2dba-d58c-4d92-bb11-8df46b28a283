@@ -1,0 +1,19 @@
+services:
+  split-app:
+    build: .
+    image: case-split-platform:1.0
+    container_name: case-split-platform
+    ports:
+      - "8000:8000"
+    volumes:
+      - split-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,json; json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  split-data:

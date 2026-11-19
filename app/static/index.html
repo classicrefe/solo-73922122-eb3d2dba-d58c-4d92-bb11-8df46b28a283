@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>病例切分平台 · 训练/评估分组</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>影像训练数据 · 病例切分平台</h1>
+  <div class="meta">
+    <span>当前输入版本：<b id="currentVersion">–</b></span>
+    <span id="healthBadge" class="badge">连接中…</span>
+  </div>
+</header>
+
+<div id="staleBanner" class="banner hidden">
+  <b>输入已被变动（可能来自另一个浏览器窗口）。</b>
+  下方旧预览与已发布清单已永久失效，不可发布或下载。<button onclick="refreshAll()">刷新数据</button>
+</div>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="data">① 数据上传</button>
+  <button class="tab" data-tab="quota">② 配额与锁定</button>
+  <button class="tab" data-tab="solve">③ 求解与发布</button>
+  <button class="tab" data-tab="manifests">④ 已发布清单</button>
+  <button class="tab" data-tab="log">⑤ 版本记录</button>
+</nav>
+
+<!-- ======================= Tab 1 数据 ======================= -->
+<section class="panel active" id="tab-data">
+  <h2>1. 上传病例 CSV</h2>
+  <p class="hint">列：<code>病例号, 患者号, 标签</code>（标签仅 0/1），至多 200 行。
+    <a href="#" id="tplCases">下载病例模板</a></p>
+  <div class="row">
+    <input type="file" id="casesFile" accept=".csv,text/csv">
+    <button onclick="uploadCases()">上传并替换病例</button>
+    <span id="casesMsg" class="msg"></span>
+  </div>
+
+  <h2>2. 上传患者亲属对 CSV</h2>
+  <p class="hint">列：<code>患者A, 患者B</code>，至多 200 行；患者必须存在于病例数据中。
+    <a href="#" id="tplRel">下载亲属模板</a>
+    同一患者及亲属关系传递相连的病例将被强制分入同一组。</p>
+  <div class="row">
+    <input type="file" id="relFile" accept=".csv,text/csv">
+    <button onclick="uploadRelatives()">上传并替换亲属对</button>
+    <span id="relMsg" class="msg"></span>
+  </div>
+
+  <h2>当前数据概览</h2>
+  <div id="overview" class="grid4"></div>
+  <h3>病例（<span id="caseCount">0</span>）</h3>
+  <div class="table-wrap">
+    <table id="caseTable"><thead>
+      <tr><th>病例号</th><th>患者号</th><th>标签</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+  <h3>亲属对（<span id="relCount">0</span>）</h3>
+  <div class="table-wrap">
+    <table id="relTable"><thead>
+      <tr><th>患者 A</th><th>患者 B</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================= Tab 2 配额与锁定 ======================= -->
+<section class="panel" id="tab-quota">
+  <h2>精确配额（硬约束，不接受近似比例）</h2>
+  <p class="hint">填写两组中各标签的<b>精确病例数量</b>。无解时求解器会列出包含配额在内的
+    不可再缩减冲突条件。可用标签总量：标签0 = <b id="totL0">0</b>，标签1 = <b id="totL1">0</b>。</p>
+  <table class="quota-table">
+    <thead><tr><th></th><th>训练集（组1）</th><th>评估集（组2）</th><th>标签总量</th></tr></thead>
+    <tbody>
+      <tr><td>标签 0</td>
+        <td><input type="number" min="0" step="1" id="q_g1_label0"></td>
+        <td><input type="number" min="0" step="1" id="q_g2_label0"></td>
+        <td id="t_l0">0</td></tr>
+      <tr><td>标签 1</td>
+        <td><input type="number" min="0" step="1" id="q_g1_label1"></td>
+        <td><input type="number" min="0" step="1" id="q_g2_label1"></td>
+        <td id="t_l1">0</td></tr>
+    </tbody>
+  </table>
+  <div class="row"><button onclick="saveQuotas()">保存配额（输入版本 +1）</button>
+    <span id="quotaMsg" class="msg"></span></div>
+
+  <h2>病例锁定（可选）</h2>
+  <p class="hint">把指定病例强制分入某一组；与该病例通过同患者/亲属关系连通的所有病例也会同组。
+    每次保存提交完整锁定表。</p>
+  <div class="row">
+    <input type="text" id="lockFilter" placeholder="按病例号/患者号筛选…" oninput="renderLocks()">
+    <button onclick="saveLocks()">保存锁定（输入版本 +1）</button>
+    <span id="lockMsg" class="msg"></span>
+  </div>
+  <div class="table-wrap">
+    <table id="lockTable"><thead>
+      <tr><th>病例号</th><th>患者号</th><th>标签</th><th>锁定分组</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================= Tab 3 求解 ======================= -->
+<section class="panel" id="tab-solve">
+  <h2>求解切分</h2>
+  <div class="row">
+    <button class="primary" onclick="runSolve()">运行 z3 求解（精确约束）</button>
+    <span class="hint">计算期间你仍可在其他窗口/标签修改输入；若输入在计算期间变动，本次结果直接作废。</span>
+  </div>
+  <div id="solveStatus" class="msg"></div>
+
+  <div id="satBox" class="hidden">
+    <h2>切分结果（预览）</h2>
+    <div id="previewWarn" class="banner warn hidden">
+      该预览依据的输入已变动，<b>已永久失效，不能发布或下载</b>，请重新求解。
+    </div>
+    <div id="solveStats" class="grid4"></div>
+    <div class="row">
+      <button class="primary" id="publishBtn" onclick="publishManifest()">发布此清单并持久化</button>
+      <span id="publishMsg" class="msg"></span>
+    </div>
+    <div class="row">
+      <label>筛选：
+        <select id="filterGroup" onchange="renderAssignments()">
+          <option value="">全部分组</option><option value="1">仅训练集</option><option value="2">仅评估集</option>
+        </select>
+      </label>
+      <label>标签：
+        <select id="filterLabel" onchange="renderAssignments()">
+          <option value="">全部</option><option value="0">0</option><option value="1">1</option>
+        </select>
+      </label>
+    </div>
+    <div class="table-wrap">
+      <table id="assignTable"><thead>
+        <tr><th>病例号</th><th>患者号</th><th>标签</th><th>分组编号</th><th>分组</th><th>锁定</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div id="unsatBox" class="hidden">
+    <h2>无解：不可再缩减的冲突条件</h2>
+    <p class="hint">以下每条约束都是导致无解的必要条件——删除其中任意一条，其余约束即可满足。
+      冲突可能同时涵盖配额、锁定、亲属/同患者关系。没有“近似比例”替代方案。</p>
+    <div id="unsatSummary" class="banner warn"></div>
+    <div class="table-wrap">
+      <table id="conflictTable"><thead>
+        <tr><th>#</th><th>来源类型</th><th>冲突条件说明</th><th>详情</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= Tab 4 清单 ======================= -->
+<section class="panel" id="tab-manifests">
+  <h2>已发布清单</h2>
+  <p class="hint">清单与其输入依据一起持久化。输入一旦变动（即使改回原值），旧清单立即永久失效，
+    不可发布或下载；记录保留可审计。</p>
+  <div class="table-wrap">
+    <table id="manifestTable"><thead>
+      <tr><th>清单 ID</th><th>输入版本</th><th>发布时间 (UTC)</th><th>病例数</th><th>状态</th><th>操作</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+  <div id="manifestDetail" class="hidden">
+    <h3>清单输入依据与切分明细</h3>
+    <pre id="manifestJson"></pre>
+  </div>
+</section>
+
+<!-- ======================= Tab 5 日志 ======================= -->
+<section class="panel" id="tab-log">
+  <h2>输入版本变动记录</h2>
+  <div class="table-wrap">
+    <table id="logTable"><thead>
+      <tr><th>版本</th><th>变动类型</th><th>详情</th><th>时间 (UTC)</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -19,11 +19,13 @@ from .models import (
     ActiveInput,
     ValidationError,
     parse_cases_csv,
+    parse_devices_csv,
     parse_relatives_csv,
     validate_locks,
     validate_quotas,
 )
-from .splitter import SplitterError, solve_split
+from .splitter import Case, RelativePair, SplitterError, build_components, solve_split
+from .bias import MAX_BIAS_COMPONENTS, BiasError, analyze_device_bias
 
 import os
 
@@ -104,6 +106,11 @@ async def _splitter_handler(_request, exc: SplitterError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
+@app.exception_handler(BiasError)
+async def _bias_handler(_request, exc: BiasError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
 @app.exception_handler(StaleVersionError)
 async def _stale_handler(_request, exc: StaleVersionError):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -128,8 +135,26 @@ def get_state():
         "label_totals": label_totals,
         "patient_count": len({c.patient_id for c in active.cases}),
         "input": active.to_json(),
-        "manifests": db.list_manifests(),
+        "manifests": [_with_bias_eligibility(m) for m in db.list_manifests()],
     }
+
+
+def _with_bias_eligibility(manifest_row: dict) -> dict:
+    """为清单列表项补充亲属连通分量数与设备偏差分析可用性标记。
+
+    分量数取自发布时求解结果中持久化的 stats.component_count；分析只允许在
+    清单仍有效且分量数 <= MAX_BIAS_COMPONENTS 时进行。
+    """
+    row = dict(manifest_row)
+    component_count = row.get("component_count")
+    row["component_count"] = component_count
+    row["bias_eligible"] = (
+        not row["expired"]
+        and component_count is not None
+        and component_count <= MAX_BIAS_COMPONENTS
+    )
+    row["bias_component_limit"] = MAX_BIAS_COMPONENTS
+    return row
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -231,7 +256,10 @@ def publish(payload: PublishPayload):
 
 @app.get("/api/manifests")
 def manifests():
-    return {"dataset_version": db.get_version(), "manifests": db.list_manifests()}
+    return {
+        "dataset_version": db.get_version(),
+        "manifests": [_with_bias_eligibility(m) for m in db.list_manifests()],
+    }
 
 
 @app.get("/api/manifests/{manifest_id}")
@@ -282,6 +310,61 @@ def manifest_download(manifest_id: str):
 @app.get("/api/version-log")
 def version_log():
     return {"current_version": db.get_version(), "log": db.version_log()}
+
+
+# --------------------------------------------------------------------------- #
+# 设备型号偏差罕见度分析（只读：不产生输入版本，不修改输入与清单）
+# --------------------------------------------------------------------------- #
+@app.post("/api/manifests/{manifest_id}/device-bias")
+async def device_bias(manifest_id: str, file: UploadFile = File(...)):
+    manifest = db.get_manifest(manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="清单不存在。")
+    if manifest["expired"]:
+        raise StaleVersionError(
+            "该清单依据的输入已变动，清单已永久失效，不能基于它做偏差分析。"
+            "请选择仍有效的清单。"
+        )
+
+    # 先按分量上限做可分析性检查（网页也据此禁用不可选项，这里再次强校验）
+    components, _ = build_components(
+        [Case(**c) for c in manifest["input"]["cases"]],
+        [RelativePair(**r) for r in manifest["input"].get("relatives", [])],
+    )
+    if len(components) > MAX_BIAS_COMPONENTS:
+        raise BiasError(
+            f"该清单的亲属连通分量为 {len(components)} 个，超过 "
+            f"{MAX_BIAS_COMPONENTS} 个的分析上限，无法在精确穷举范围内给出结论。"
+        )
+
+    # CSV 解析/校验全部通过后才开始计算；失败不触碰输入与清单
+    raw = await _read_upload(file)
+    devices = parse_devices_csv(
+        raw, [c["case_id"] for c in manifest["input"]["cases"]]
+    )
+
+    # 计算期间清单可能被其他窗口的输入变动作废：周期性复核，失效则不返回结论
+    def _ensure_current():
+        if not db.is_manifest_current(manifest_id):
+            raise StaleVersionError(
+                "计算期间该清单依据的输入已变动，清单已失效，本次分析作废，"
+                "不返回可用结论。输入与清单未被本次分析修改。"
+            )
+
+    _ensure_current()
+    result = analyze_device_bias(
+        input_data=manifest["input"],
+        assignments=manifest["result"]["assignments"],
+        devices=devices,
+        should_cancel=_ensure_current,
+    )
+    _ensure_current()
+    return {
+        "manifest_id": manifest_id,
+        "dataset_version": manifest["dataset_version"],
+        "device_row_count": len(devices),
+        "result": result,
+    }
 
 
 # 静态前端（最后挂载，避免覆盖 /api 路由）

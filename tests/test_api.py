@@ -241,3 +241,167 @@ def test_lock_violation_unsat_lists_lock_and_quota(client):
     assert r["result"]["status"] == "unsat"
     kinds = {c["kind"] for c in r["result"]["conflicts"]}
     assert "lock" in kinds and "quota" in kinds
+
+
+# --------------------------------------------------------------------------- #
+# 设备型号偏差罕见度分析
+# --------------------------------------------------------------------------- #
+def _publish_a_manifest(client):
+    _upload_cases(client)
+    client.post("/api/upload/relatives",
+                files={"file": ("r.csv", REL_CSV.encode("utf-8"))})
+    _set_quotas(client, (2, 2, 2, 2))
+    token = client.post("/api/solve").json()["preview_token"]
+    return client.post("/api/publish", json={"preview_token": token}).json()
+
+
+def _device_csv(mapping):
+    lines = ["病例号,设备型号"]
+    lines += [f"{cid},{model}" for cid, model in mapping.items()]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def test_manifest_list_carries_bias_eligibility(client):
+    m = _publish_a_manifest(client)
+    state = client.get("/api/state").json()
+    row = next(x for x in state["manifests"] if x["manifest_id"] == m["manifest_id"])
+    # 两个亲属连通分量（P1+P2、P3+P4），<=16，且清单有效
+    assert row["component_count"] == 2
+    assert row["bias_eligible"] is True
+    assert row["bias_component_limit"] == 16
+
+
+def test_device_bias_full_flow_and_read_only(client):
+    m = _publish_a_manifest(client)
+    mid = m["manifest_id"]
+    version_before = client.get("/api/health").json()["version"]
+    devices = {f"C{i}": ("A" if i % 2 else "B") for i in range(1, 9)}
+    r = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("devices.csv", _device_csv(devices), "text/csv")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    res = body["result"]
+    # 分析是只读操作：输入版本不变
+    assert client.get("/api/health").json()["version"] == version_before
+    assert body["device_row_count"] == 8
+    assert res["legal_split_total"] >= 1
+    assert 1 <= res["rare_count"] <= res["legal_split_total"]
+    assert res["rare_ratio"]["numerator"] / res["rare_ratio"]["denominator"] <= 1
+    # 精确分数字段齐全
+    for key in ("current_bias", "current_bias_abs", "rare_ratio",
+                "device_a_proportions"):
+        assert key in res
+    # 分量与清单依据一致
+    assert res["component_count"] == 2
+    # 当前清单本身是合法切分，必然计入罕见数
+    assert res["rare_count"] >= 1
+
+
+def test_device_bias_rejects_bad_csv_without_touching_data(client):
+    m = _publish_a_manifest(client)
+    mid = m["manifest_id"]
+    version_before = client.get("/api/health").json()["version"]
+    # 重复病例号 + 未知型号 + 缺失病例
+    bad = "病例号,设备型号\nC1,A\nC1,B\nC2,C\n".encode()
+    r = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("bad.csv", bad, "text/csv")},
+    )
+    assert r.status_code == 400
+    joined = "；".join(r.json()["errors"])
+    assert "重复" in joined and "A 或 B" in joined
+    # 覆盖不全（缺 C3..C8）单独拒绝
+    incomplete = _device_csv({f"C{i}": "A" for i in range(1, 5)})
+    r2 = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("incomplete.csv", incomplete, "text/csv")},
+    )
+    assert r2.status_code == 400 and "未覆盖全部病例" in r2.json()["errors"][0]
+    # 失败不改变版本、不影响清单有效性
+    assert client.get("/api/health").json()["version"] == version_before
+    detail = client.get(f"/api/manifests/{mid}").json()
+    assert detail["expired"] is False
+
+
+def test_device_bias_unknown_case_rejected(client):
+    m = _publish_a_manifest(client)
+    devices = {f"C{i}": "A" for i in range(1, 9)}
+    devices["C999"] = "B"
+    r = client.post(
+        f"/api/manifests/{m['manifest_id']}/device-bias",
+        files={"file": ("d.csv", _device_csv(devices), "text/csv")},
+    )
+    assert r.status_code == 400 and "C999" in r.json()["errors"][0]
+
+
+def test_device_bias_on_invalidated_manifest_returns_409(client):
+    m = _publish_a_manifest(client)
+    mid = m["manifest_id"]
+    # 输入变动使清单失效
+    client.put("/api/locks", json={"locks": [{"case_id": "C1", "group": 2}]})
+    devices = {f"C{i}": "A" for i in range(1, 9)}
+    r = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("d.csv", _device_csv(devices), "text/csv")},
+    )
+    assert r.status_code == 409 and "失效" in r.json()["detail"]
+
+
+def test_device_bias_manifest_not_found(client):
+    _upload_cases(client)
+    r = client.post(
+        "/api/manifests/nonexistent/device-bias",
+        files={"file": ("d.csv", _device_csv({"C1": "A"}), "text/csv")},
+    )
+    assert r.status_code == 404
+
+
+def test_device_bias_rejected_when_invalidated_during_computation(client, monkeypatch):
+    m = _publish_a_manifest(client)
+    mid = m["manifest_id"]
+
+    # 让枚举过程中的失效检查观察到“清单已失效”，模拟计算期间输入变动
+    import app.main as main
+    original = main.db.is_manifest_current
+
+    def flaky(manifest_id):
+        if manifest_id == mid:
+            return False
+        return original(manifest_id)
+
+    monkeypatch.setattr(main.db, "is_manifest_current", flaky)
+    devices = {f"C{i}": "A" for i in range(1, 9)}
+    r = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("d.csv", _device_csv(devices), "text/csv")},
+    )
+    assert r.status_code == 409
+    assert "计算期间" in r.json()["detail"] and "作废" in r.json()["detail"]
+    # 输入与清单未被分析修改
+    assert client.get(f"/api/manifests/{mid}").json()["invalidated"] is False
+
+
+def test_device_bias_component_limit_enforced(client):
+    # 构造 17 个互不相连的单病例分量并发布
+    cases = "病例号,患者号,标签\n" + "\n".join(
+        f"C{i:03d},P{i:03d},{i % 2}" for i in range(1, 18))
+    r = client.post("/api/upload/cases",
+                    files={"file": ("big.csv", cases.encode(), "text/csv")})
+    assert r.status_code == 200
+    client.put("/api/quotas", json={
+        "g1_label0": 4, "g1_label1": 5, "g2_label0": 4, "g2_label1": 4})
+    solved = client.post("/api/solve").json()
+    assert solved["result"]["status"] == "sat"
+    mid = client.post("/api/publish",
+                      json={"preview_token": solved["preview_token"]}).json()["manifest_id"]
+    state = client.get("/api/state").json()
+    row = next(x for x in state["manifests"] if x["manifest_id"] == mid)
+    assert row["component_count"] == 17 and row["bias_eligible"] is False
+    devices = {f"C{i:03d}": "A" for i in range(1, 18)}
+    r2 = client.post(
+        f"/api/manifests/{mid}/device-bias",
+        files={"file": ("d.csv", _device_csv(devices), "text/csv")},
+    )
+    assert r2.status_code == 400 and "17" in r2.json()["detail"]

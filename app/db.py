@@ -118,6 +118,7 @@ class Database:
                     "invalidated_at": r["invalidated_at"],
                     "expired": expired,
                     "case_count": result.get("stats", {}).get("case_count"),
+                    "component_count": result.get("stats", {}).get("component_count"),
                     "counts": result.get("stats", {}).get("counts"),
                 }
             )
@@ -144,6 +145,19 @@ class Database:
             "invalidated_at": row["invalidated_at"],
             "expired": expired,
         }
+
+    def is_manifest_current(self, manifest_id: str) -> Optional[bool]:
+        """轻量版本复核：None=清单不存在；True=仍有效；False=已失效。"""
+        current_version = self.get_version()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT dataset_version, invalidated FROM published_manifests"
+                " WHERE manifest_id = ?",
+                (manifest_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (not bool(row["invalidated"])) and row["dataset_version"] == current_version
 
     # ------------------------------------------------------------------ #
     # 写（每个方法一个 IMMEDIATE 事务；异常回滚，源数据不变）

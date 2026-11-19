@@ -64,6 +64,10 @@ $("tplRel").addEventListener("click", (e) => {
   e.preventDefault();
   downloadCsv("relatives_template.csv", "患者A,患者B\nP001,P002\n");
 });
+$("tplDevices").addEventListener("click", (e) => {
+  e.preventDefault();
+  downloadCsv("devices_template.csv", "病例号,设备型号\nC001,A\nC002,B\n");
+});
 
 // --------------------------------------------------------------------------- //
 // 上传
@@ -135,6 +139,7 @@ function renderState() {
   }
   renderLocks();
   renderManifestTable();
+  renderBiasManifestSelect();
 }
 
 // --------------------------------------------------------------------------- //
@@ -370,6 +375,112 @@ async function downloadManifest(id) {
   a.download = `split_manifest_${id.slice(0, 8)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// --------------------------------------------------------------------------- //
+// 设备偏差分析
+// --------------------------------------------------------------------------- //
+function renderBiasManifestSelect() {
+  if (!currentState) return;
+  const sel = $("biasManifest");
+  const previous = sel.value;
+  const manifests = currentState.manifests || [];
+  const eligible = manifests.filter((m) => m.bias_eligible);
+  if (!manifests.length) {
+    sel.innerHTML = `<option value="">（暂无已发布清单，请先在③求解并发布）</option>`;
+    sel.disabled = true;
+    $("biasManifestHint").textContent = "请先发布一个清单。";
+    return;
+  }
+  sel.disabled = false;
+  sel.innerHTML = manifests.map((m) => {
+    const label = `${m.manifest_id.slice(0, 8)}…（v${m.dataset_version}，`
+      + `${m.case_count ?? "?"} 病例，分量 ${m.component_count ?? "?"}）`
+      + (m.bias_eligible ? "" : m.expired ? "［已失效］" : "［分量超 16］");
+    return `<option value="${m.manifest_id}"${m.bias_eligible ? "" : " disabled"}>`
+      + `${label}</option>`;
+  }).join("");
+  if (previous && [...sel.options].some((o) => o.value === previous && !o.disabled)) {
+    sel.value = previous;
+  } else if (eligible.length) {
+    sel.value = eligible[0].manifest_id;
+  }
+  const chosen = manifests.find((m) => m.manifest_id === sel.value);
+  $("biasManifestHint").textContent = chosen
+    ? (chosen.bias_eligible
+      ? `该清单含 ${chosen.component_count} 个亲属连通分量，可精确穷举 ${2 ** chosen.component_count} 种以内的分量组合。`
+      : (chosen.expired ? "该清单已永久失效，不能分析，请选择有效清单。"
+        : `分量数 ${chosen.component_count} 超过 16，无法精确穷举。`))
+    : "没有可分析的有效清单。";
+}
+
+function _fracText(f) {
+  if (!f) return "";
+  return `${f.numerator}/${f.denominator}`;
+}
+
+async function runDeviceBias() {
+  const manifestId = $("biasManifest").value;
+  if (!manifestId) return setMsg("biasMsg", "请先选择一个有效的已发布清单");
+  const f = $("devicesFile").files[0];
+  if (!f) return setMsg("biasMsg", "请先选择设备型号 CSV 文件");
+  const fd = new FormData();
+  fd.append("file", f);
+  setMsg("biasMsg", "枚举合法切分中（分量 ≤ 16，精确穷举）…");
+  $("biasResult").classList.add("hidden");
+  try {
+    const r = await api(`/api/manifests/${manifestId}/device-bias`,
+      { method: "POST", body: fd });
+    setMsg("biasMsg", `分析完成（清单 v${r.dataset_version}，${r.device_row_count} 个病例）`, true);
+    renderBiasResult(r.result);
+  } catch (err) {
+    setMsg("biasMsg", err.message);
+  }
+}
+
+function renderBiasResult(res) {
+  $("biasResult").classList.remove("hidden");
+  $("biasSingleWarn").classList.toggle("hidden", !res.single_legal_split);
+
+  $("biasStats").innerHTML = [
+    ["现值偏差（组1−组2 A占比）", _fracText(res.current_bias)],
+    ["现值偏差绝对值", _fracText(res.current_bias_abs)],
+    ["罕见切分数量", res.rare_count],
+    ["合法切分总数", res.legal_split_total],
+  ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join("");
+
+  const rows = [
+    ["组1 A 占比", _fracText(res.device_a_proportions["1"]),
+     res.device_a_proportions["1"].decimal,
+     `${res.group_a_counts["1"]} / ${res.group_sizes["1"]} 个病例为 A`],
+    ["组2 A 占比", _fracText(res.device_a_proportions["2"]),
+     res.device_a_proportions["2"].decimal,
+     `${res.group_a_counts["2"]} / ${res.group_sizes["2"]} 个病例为 A`],
+    ["现值偏差（带符号）", _fracText(res.current_bias), res.current_bias.decimal,
+     "组1 A占比 − 组2 A占比"],
+    ["现值偏差绝对值", _fracText(res.current_bias_abs), res.current_bias_abs.decimal,
+     "罕见度比较阈值：|偏差| ≥ 该值"],
+    ["罕见切分数量", res.rare_count, "",
+     "所有合法切分中 |偏差| 不小于现值的数量"],
+    ["合法切分总数", res.legal_split_total, "",
+     "满足亲属同组、四格精确配额、锁定规则的切分总数"],
+    ["精确比例", _fracText(res.rare_ratio), res.rare_ratio.decimal,
+      `${res.rare_count} / ${res.legal_split_total}（已约分）`],
+  ].map(([k, frac, dec, note]) => `<tr><td>${k}</td><td><code>${frac}</code></td>`
+    + `<td>${dec === "" ? "" : dec}</td><td class="hint">${escapeHtml(note)}</td></tr>`)
+    .join("");
+  $("biasTable").querySelector("tbody").innerHTML = rows;
+
+  $("biasCompCount").textContent = res.components.length;
+  $("biasCompTable").querySelector("tbody").innerHTML = res.components.map((c) => `<tr>
+    <td><code>${escapeHtml(c.root)}</code></td>
+    <td>${c.case_count}</td>
+    <td>${c.label_counts["0"]} / ${c.label_counts["1"]}</td>
+    <td>${c.device_counts.A} / ${c.device_counts.B}</td>
+    <td>${c.locked_group ? `组${c.locked_group}` : "未锁定"}</td>
+  </tr>`).join("");
+
+  $("biasJudgement").textContent = "结论：" + res.judgement;
 }
 
 // --------------------------------------------------------------------------- //

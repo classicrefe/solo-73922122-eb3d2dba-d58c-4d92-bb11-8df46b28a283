@@ -25,7 +25,8 @@
   <button class="tab" data-tab="quota">② 配额与锁定</button>
   <button class="tab" data-tab="solve">③ 求解与发布</button>
   <button class="tab" data-tab="manifests">④ 已发布清单</button>
-  <button class="tab" data-tab="log">⑤ 版本记录</button>
+  <button class="tab" data-tab="bias">⑤ 设备偏差分析</button>
+  <button class="tab" data-tab="log">⑥ 版本记录</button>
 </nav>
 
 <!-- ======================= Tab 1 数据 ======================= -->
@@ -168,7 +169,57 @@
   </div>
 </section>
 
-<!-- ======================= Tab 5 日志 ======================= -->
+<!-- ======================= Tab 5 设备偏差分析 ======================= -->
+<section class="panel" id="tab-bias">
+  <h2>设备型号偏差罕见度分析</h2>
+  <p class="hint">
+    已发布清单可能偏向某种扫描设备。选择一个<b>仍有效且亲属连通分量 ≤ 16</b> 的清单，
+    上传覆盖其<b>全部病例</b>的设备 CSV（列：<code>病例号,设备型号</code>，型号仅 A/B）。
+    系统按清单原有的“亲属同组 + 四格标签精确配额 + 锁定”规则，枚举<b>所有合法切分</b>
+    （分量 ≤ 16 时至多 2<sup>16</sup>=65536 种，精确穷举不抽样），统计两组 A 占比之差
+    （按病例数，组1减组2）的绝对值不小于现值的切分数量，并给出精确比例。
+    <a href="#" id="tplDevices">下载设备模板</a>
+  </p>
+  <p class="hint">
+    病例重复、缺失、未知病例、型号非 A/B、任一组为空或清单已失效都会被拒绝；
+    分析为<b>只读操作</b>，不产生输入版本、不修改输入与清单。
+  </p>
+
+  <div class="row">
+    <label>选择有效清单：
+      <select id="biasManifest"></select>
+    </label>
+    <span id="biasManifestHint" class="hint"></span>
+  </div>
+  <div class="row">
+    <input type="file" id="devicesFile" accept=".csv,text/csv">
+    <button class="primary" onclick="runDeviceBias()">上传设备 CSV 并分析</button>
+    <span id="biasMsg" class="msg"></span>
+  </div>
+
+  <div id="biasResult" class="hidden">
+    <div id="biasSingleWarn" class="banner warn hidden">
+      <b>仅有一种合法切分：无法判断当前偏差是否异常。</b>
+      没有其他切分可作为对照，罕见度恒为 1/1，不能据此认定设备偏差罕见或常见。
+    </div>
+    <div id="biasStats" class="grid4"></div>
+    <h3>现值与罕见度</h3>
+    <div class="table-wrap">
+      <table id="biasTable"><thead>
+        <tr><th>指标</th><th>精确值（分数）</th><th>小数</th><th>说明</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <h3>连通分量（<span id="biasCompCount">0</span> 个）</h3>
+    <div class="table-wrap">
+      <table id="biasCompTable"><thead>
+        <tr><th>代表病例</th><th>病例数</th><th>标签0/1</th><th>设备 A/B</th><th>锁定</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <p id="biasJudgement" class="hint"></p>
+  </div>
+</section>
+
+<!-- ======================= Tab 6 日志 ======================= -->
 <section class="panel" id="tab-log">
   <h2>输入版本变动记录</h2>
   <div class="table-wrap">
